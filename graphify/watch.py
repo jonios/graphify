@@ -2669,6 +2669,16 @@ def _rebuild_code(
                     _add_deleted_source(deleted_in_root)
             from graphify.extractors.terraform import refresh_terraform_paths
             wanted = refresh_terraform_paths(wanted, code_files, changed_paths)
+            # Config-dispatch edges live in the calling file but depend on the
+            # owner module: re-extract the unchanged dependents of a change.
+            from graphify.extractors.js_config_dispatch import dispatch_refresh_paths
+            from graphify.extractors.resolution import _parse_js_tree, _resolve_js_module_path
+            for dependent in dispatch_refresh_paths(
+                wanted, deleted_source_identities, code_files, existing_graph,
+                (project_root, watch_root), _parse_js_tree, _resolve_js_module_path,
+            ):
+                if dependent not in wanted and Path(os.path.abspath(dependent)) not in semantic_doc_set:
+                    wanted.append(dependent)
             if not wanted and not deleted_paths:
                 print("[graphify watch] No tracked code files in change set - skipping rebuild.")
                 return True

@@ -272,7 +272,14 @@ def test_dynamic_dispatch_through_config_stays_unresolved(tmp_path):
                    "  return CONFIG.bulk.submit(p);\n"
                    "}\n"),
     })
-    assert ("save()", ".submit()") not in _calls(r)
+    # Config extraction itself never links the dispatch by name. Owner-traced
+    # config dispatch may: `getConfig(t)` falls back to CONFIG for every key but
+    # its own `bulk`, so `.bulk.submit` is reachable, as an INFERRED edge only.
+    lbl = {n["id"]: n["label"] for n in r["nodes"]}
+    dispatch = [e for e in r["edges"] if e["relation"] == "calls"
+                and lbl.get(e["source"]) == "save()" and lbl.get(e["target"]) == ".submit()"]
+    assert all(e["confidence"] == "INFERRED" and e.get("context") == "config_dispatch"
+               for e in dispatch)
 
 
 def test_non_function_property_values_add_no_members(tmp_path):

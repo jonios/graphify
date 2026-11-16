@@ -3514,6 +3514,7 @@ def _augment_symbol_resolution_edges(
     ambiguous_python_modules: set[str] | None = None,
     resolution_context_nodes: list[dict] | None = None,
     raw_calls: list[dict] | None = None,
+    resolution_context_edges: list[dict] | None = None,
 ) -> None:
     facts = _SymbolResolutionFacts()
     _collect_js_symbol_resolution_facts(paths, facts)
@@ -3533,6 +3534,79 @@ def _augment_symbol_resolution_edges(
         _apply_symbol_resolution_facts(paths, nodes, edges, root, facts, raw_calls=raw_calls)
     else:
         _apply_symbol_resolution_facts(paths, nodes, edges, root, facts)
+    if raw_calls:
+        _resolve_js_config_dispatch(
+            paths, nodes, edges, root, facts, raw_calls,
+            resolution_context_nodes, resolution_context_edges,
+        )
+
+
+def _js_importers_index(
+    nodes: list[dict],
+    root: Path,
+    facts: _SymbolResolutionFacts,
+    resolution_context_nodes: list[dict] | None,
+    resolution_context_edges: list[dict] | None,
+) -> Callable[[Path], set[Path]]:
+    """Modules importing a given module: directly or through a barrel (fresh
+    facts), plus unchanged importers recorded by persisted import edges."""
+    reexports: dict[Path, set[Path]] = {}
+    for fact in facts.exports:
+        if fact.target_path is not None:
+            reexports.setdefault(_resolve_cached(fact.file_path), set()).add(_resolve_cached(fact.target_path))
+    for star in facts.star_exports:
+        reexports.setdefault(_resolve_cached(star.file_path), set()).add(_resolve_cached(star.target_path))
+    importers: dict[Path, set[Path]] = {}
+    for fact in facts.imports:
+        source = _resolve_cached(fact.file_path)
+        seen: set[Path] = set()
+        frontier = [_resolve_cached(fact.target_path)]
+        while frontier and len(seen) < 64:
+            target = frontier.pop()
+            if target in seen:
+                continue
+            seen.add(target)
+            importers.setdefault(target, set()).add(source)
+            frontier.extend(reexports.get(target, ()))
+    if resolution_context_edges:
+        file_of = {}
+        for node in [*nodes, *(resolution_context_nodes or ())]:
+            path = _js_source_path(str(node.get("source_file") or ""), root)
+            if path is not None and node.get("id"):
+                file_of[str(node["id"])] = path
+        for edge in resolution_context_edges:
+            if edge.get("relation") not in ("imports", "imports_from"):
+                continue
+            target = file_of.get(str(edge.get("target")))
+            source = _js_source_path(str(edge.get("source_file") or ""), root)
+            if target is not None and source is not None and source != target:
+                importers.setdefault(target, set()).add(source)
+
+    def importers_of(path: Path) -> set[Path]:
+        return set(importers.get(_resolve_cached(path), ()))
+
+    return importers_of
+
+
+def _resolve_js_config_dispatch(
+    paths: list[Path],
+    nodes: list[dict],
+    edges: list[dict],
+    root: Path,
+    facts: _SymbolResolutionFacts,
+    raw_calls: list[dict],
+    resolution_context_nodes: list[dict] | None,
+    resolution_context_edges: list[dict] | None,
+) -> None:
+    from graphify.extractors.js_config_dispatch import resolve_config_dispatch
+
+    if not any(effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES for path in paths):
+        return
+    resolve_config_dispatch(
+        paths, nodes, edges, root, raw_calls, resolution_context_nodes,
+        _js_importers_index(nodes, root, facts, resolution_context_nodes, resolution_context_edges),
+        _parse_js_tree, _resolve_js_module_path, _js_source_path,
+    )
 
 def _resolve_cross_file_imports(
     per_file: list[dict],

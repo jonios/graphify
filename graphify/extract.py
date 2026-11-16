@@ -11949,6 +11949,7 @@ def extract(
         ambiguous_python_modules=ambiguous_python_modules,
         resolution_context_nodes=resolution_context_nodes,
         raw_calls=all_raw_calls,
+        resolution_context_edges=resolution_context_edges,
     )
     # Member JSX tags (`<UI.Button />`) resolve only through the import facts
     # above. Every later resolver would bind them by their last segment alone.
