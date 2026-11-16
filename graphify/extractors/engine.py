@@ -4462,8 +4462,10 @@ def _ts_receiver_type_table(
       * a type-annotated parameter ``(svc: Svc)`` -> ``svc: Svc`` (Pattern B), so a
         call on the param — including inside a returned closure — resolves.
 
-    File-scoped, first-binding-wins (merged into the constructor-injection table,
-    which is populated first and therefore wins on a name clash). Only a bare
+    File-scoped. A name whose local bindings (including `x = new Foo()`
+    reassignments) disagree on the type is left out as ambiguous; the
+    constructor-injection table is populated first and still wins on a name
+    clash. Only a bare
     ``type_identifier`` (a single class/interface name) is recorded — an array,
     union, generic, qualified, or predefined type is skipped (precision over
     recall, matching the receiver-typed resolvers for Swift/C#/C++)."""
@@ -4500,6 +4502,14 @@ def _ts_receiver_type_table(
 
     constructor_assigned: dict[str, dict[str, set[str]]] = {}
     method_assigned: dict[str, dict[str, set[str]]] = {}
+    # Local `new` bindings and typed parameters, by name. The table is file-wide,
+    # so a name typed differently in two places (`let Api = new RouteApi()` here,
+    # `let Api = new OrderApi()` there) is ambiguous: it is left out rather than
+    # keeping whichever the walk met first (the C++ table's rule, #3215).
+    # `x = new Foo()` reassignments only count as conflicting evidence for a name
+    # already bound above; on their own they type nothing.
+    local_types: dict[str, set[str]] = {}
+    reassigned_types: dict[str, set[str]] = {}
     stack = [root]
     while stack:
         n = stack.pop()
@@ -4513,16 +4523,25 @@ def _ts_receiver_type_table(
                 if ctor is not None and ctor.type in ("identifier", "type_identifier"):
                     name = _read_text(name_n, source)
                     tname = _read_text(ctor, source)
-                    if name and tname and name not in table:
-                        table[name] = tname
+                    if name and tname:
+                        local_types.setdefault(name, set()).add(tname)
+        elif t == "assignment_expression":
+            left = n.child_by_field_name("left")
+            right = n.child_by_field_name("right")
+            if (left is not None and left.type == "identifier"
+                    and right is not None and right.type == "new_expression"):
+                name = _read_text(left, source)
+                tname = _new_type(right)
+                if name and tname:
+                    reassigned_types.setdefault(name, set()).add(tname)
         elif t == "required_parameter" or t == "optional_parameter":
             pat = n.child_by_field_name("pattern")
             ann = n.child_by_field_name("type")
             if pat is not None and pat.type == "identifier" and ann is not None:
                 tname = _bare_type_ident(ann)
                 name = _read_text(pat, source)
-                if name and tname and name not in table:
-                    table[name] = tname
+                if name and tname:
+                    local_types.setdefault(name, set()).add(tname)
         elif t in ("public_field_definition", "field_definition") and field_table is not None:
             # A class field (`protected repo: Repo`, `#root: Node = new Node()`,
             # `private logger = new Logger()`) is what `this.repo.m()` reads, the
@@ -4628,6 +4647,11 @@ def _ts_receiver_type_table(
                     pending.extend(item.children)
         for c in n.children:
             stack.append(c)
+    for name, types in local_types.items():
+        types = types | reassigned_types.get(name, set())
+        # Constructor-injection entries (populated before this helper) still win.
+        if len(types) == 1 and name not in table:
+            table[name] = next(iter(types))
     if field_table is not None:
         # Declared field/accessor/parameter-property types were inserted directly
         # into field_table during the walk. Constructor assignments are next, and
@@ -10556,6 +10580,7 @@ def _extract_generic(
             is_scoped_call: bool = False
             swift_receiver: str | None = None
             member_receiver: str | None = None
+            ts_constructed_type: str | None = None  # JS/TS `new Api().m()` receiver
             kotlin_qualified_prefix: str | None = None
             kotlin_object_receiver: str | None = None
             csharp_qualified_prefix: str | None = None
@@ -11097,6 +11122,20 @@ def _extract_generic(
                                     if inner_prop is not None:
                                         member_receiver = _read_text(inner_prop, source)
                                         is_this_field_call = True
+                            elif (obj is not None
+                                  and config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")):
+                                # `new Api().m()` / `(new Api()).m()`: the receiver is
+                                # an instance of the constructor named in source. Kept
+                                # off member_receiver (which other JS passes read as a
+                                # name in scope) and handed only to the receiver-typed
+                                # resolver.
+                                ctor_obj = obj
+                                while ctor_obj is not None and ctor_obj.type == "parenthesized_expression":
+                                    ctor_obj = next((c for c in ctor_obj.children if c.is_named), None)
+                                if ctor_obj is not None and ctor_obj.type == "new_expression":
+                                    ctor = ctor_obj.child_by_field_name("constructor")
+                                    if ctor is not None and ctor.type == "identifier":
+                                        ts_constructed_type = _read_text(ctor, source)
                     else:
                         # Try reading the node directly (e.g. Java name field is the callee)
                         callee_name = _read_text(func_node, source)
@@ -11387,6 +11426,8 @@ def _extract_generic(
                                 node, member_receiver, source, js_receiver_bindings,
                             )
                             rc_entry["_js_construct"] = node.type == "new_expression"
+                            if ts_constructed_type:
+                                rc_entry["ts_constructed_type"] = ts_constructed_type
                         if python_receiver_shadowed is not None and is_member_call:
                             rc_entry["_python_receiver_shadowed"] = python_receiver_shadowed(
                                 node, member_receiver or ""

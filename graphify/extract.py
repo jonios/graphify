@@ -6214,7 +6214,12 @@ def _resolve_typescript_member_calls(
         for static, attr in ((False, "_ts_fields"), (True, "_ts_static_fields")):
             for fname, ftype in (n.get(attr) or {}).items():
                 ts_fields_by_id.setdefault((str(n.get("id")), static), {}).setdefault(fname, ftype)
-    if not type_table_by_file and not ts_fields_by_id:
+    # A `new Api().m()` receiver carries its own type, so it needs no table.
+    has_constructed_receiver = any(
+        rc.get("ts_constructed_type")
+        for result in per_file for rc in result.get("raw_calls", ())
+    )
+    if not type_table_by_file and not ts_fields_by_id and not has_constructed_receiver:
         return
 
     contained = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
@@ -6312,13 +6317,21 @@ def _resolve_typescript_member_calls(
     for rc in all_raw_calls:
         if not rc.get("is_member_call"):
             continue
-        receiver = rc.get("receiver")
+        constructed_type = rc.get("ts_constructed_type")
+        receiver = rc.get("receiver") or constructed_type
         callee = rc.get("callee")
         caller = rc.get("caller_nid")
         if not receiver or not callee or not caller:
             continue
         declaring_nid: str | None = None
-        if receiver[:1].isupper():
+        file_table = type_table_by_file.get(rc.get("source_file", ""), {})
+        if constructed_type:
+            # `new Api().m()`: the constructor names the type in source.
+            type_name = constructed_type
+            type_qualified = True
+        elif receiver[:1].isupper() and (rc.get("ts_this_field") or receiver not in file_table):
+            # A capitalized name is a class reference unless the file binds it
+            # as a variable (`let Route = new RouteApi()`), typed below.
             type_name = receiver
             type_qualified = True  # the receiver names the type in source
         else:
@@ -6333,7 +6346,7 @@ def _resolve_typescript_member_calls(
                 hit = _field_type(owner_nid, str(receiver), bool(rc.get("ts_static_this")))
                 type_name, declaring_nid = hit if hit else (None, None)
             else:
-                type_name = type_table_by_file.get(rc.get("source_file", ""), {}).get(receiver)
+                type_name = file_table.get(receiver)
         if not type_name:
             continue
         # A builtin global receiver type (Date, Promise, Map, ...) must not resolve
