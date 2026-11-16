@@ -1799,6 +1799,47 @@ def _apply_symbol_resolution_facts(
                 Path(call["source_file"]), target_file=str(target_path),
             )
 
+    # A bare JSX tag renders whatever its local name is bound to, so a component
+    # imported under another name (`{ Button as B }`, `import Fancy from`) is
+    # found through the import facts, not by label. Same rules as the member
+    # calls above: an unshadowed import binding, exactly one exported origin,
+    # and a top-level symbol node. Component values (`styled.div`, `memo(...)`)
+    # are valid targets, as they already are for same-name tags.
+    jsx_tags = [
+        call for call in raw_calls or ()
+        if call.get("_js_jsx") and not call.get("is_member_call")
+        and not call.get("_js_callee_shadowed")
+    ]
+    if jsx_tags:
+        tag_bindings: dict[tuple[Path, str], tuple[Path, str] | None] = {}
+        for fact in facts.imports:
+            key = (_resolve_cached(fact.file_path), fact.local_name)
+            # A namespace binding is a module object, not a component. A
+            # whole-module `require()` / `import X = require()` is recorded as
+            # both namespace and default, so it stays unresolved too.
+            binding = None if fact.imported_name == "*" else (
+                _resolve_cached(fact.target_path), fact.imported_name
+            )
+            tag_bindings[key] = binding if tag_bindings.get(key, binding) == binding else None
+        for call in jsx_tags:
+            source_path = _js_source_path(str(call.get("source_file", "")), root)
+            binding = tag_bindings.get((source_path, str(call.get("callee") or "")))
+            if source_path is None or binding is None:
+                continue
+            candidates, _ = exported_candidates(binding, frozenset())
+            if len(candidates) != 1:
+                continue
+            origin = next(iter(candidates))
+            target_id = symbol_nodes.get(origin)
+            if target_id is None or origin in member_symbol_keys:
+                continue
+            add_edge(
+                call["caller_nid"], target_id, "calls", "call",
+                int(str(call["source_location"]).removeprefix("L")),
+                Path(call["source_file"]),
+                target_file=str(path_by_resolved.get(origin[0], origin[0])),
+            )
+
     # The structural extractor names the imported symbol on the immediate barrel,
     # which defines nothing, so its edge dangles and build mints an external stub
     # beside the edge the loop above added to the defining symbol (#4486). Drop
@@ -3418,6 +3459,53 @@ def _collect_python_symbol_resolution_facts(
                     )
                 )
 
+def _collect_js_context_export_facts(
+    paths: list[Path],
+    root: Path,
+    facts: _SymbolResolutionFacts,
+    resolution_context_nodes: list[dict],
+) -> None:
+    """Export chains through unchanged JS files, for an incremental update.
+
+    An incremental update parses only the changed files, so an import resolving
+    through an unchanged one (`export default Button`, a barrel's
+    `export { X } from`, `export *`) had no export facts to follow, and the
+    edge a full rebuild finds was missing. Read those files' export-side facts:
+    starting from what the changed files import or re-export, follow only
+    re-exports (and the imports a re-export forwards). Only facts that answer
+    "what does this module export" are added; declarations, namespace exports
+    and uses are not, so nothing owned by an unchanged file is created.
+    """
+    context_files: set[Path] = set()
+    for node in resolution_context_nodes:
+        path = _js_source_path(str(node.get("source_file", "")), root)
+        if path is not None and effective_suffix(path) in _JS_CACHE_BYPASS_SUFFIXES:
+            context_files.add(path)
+    if not context_files:
+        return
+
+    def export_targets(found: _SymbolResolutionFacts, follow_imports: bool) -> set[Path]:
+        targets = {fact.target_path for fact in found.star_exports}
+        targets |= {fact.target_path for fact in found.exports if fact.target_path is not None}
+        forwarded = {(fact.file_path, fact.local_name) for fact in found.exports
+                     if fact.local_name is not None}
+        targets |= {fact.target_path for fact in found.imports
+                    if follow_imports or (fact.file_path, fact.local_name) in forwarded}
+        return {_resolve_cached(target) for target in targets}
+
+    parsed = {_resolve_cached(path) for path in paths}
+    frontier = (export_targets(facts, follow_imports=True) & context_files) - parsed
+    while frontier:
+        found = _SymbolResolutionFacts()
+        _collect_js_symbol_resolution_facts(sorted(frontier), found)
+        parsed |= frontier
+        facts.imports.extend(found.imports)
+        facts.aliases.extend(found.aliases)
+        facts.exports.extend(found.exports)
+        facts.star_exports.extend(found.star_exports)
+        frontier = (export_targets(found, follow_imports=False) & context_files) - parsed
+
+
 def _augment_symbol_resolution_edges(
     paths: list[Path],
     nodes: list[dict],
@@ -3429,6 +3517,8 @@ def _augment_symbol_resolution_edges(
 ) -> None:
     facts = _SymbolResolutionFacts()
     _collect_js_symbol_resolution_facts(paths, facts)
+    if resolution_context_nodes:
+        _collect_js_context_export_facts(paths, root, facts, resolution_context_nodes)
     _collect_python_symbol_resolution_facts(
         paths, root, facts,
         ambiguous_python_modules=ambiguous_python_modules,

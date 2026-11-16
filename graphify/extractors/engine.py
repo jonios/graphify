@@ -11170,12 +11170,39 @@ def _extract_generic(
                     # Same rule as the JSX transform: a tag starting with a lowercase
                     # letter (`<div>`) is an intrinsic element, not a symbol in scope,
                     # so it must not bind by name to a same-named function.
-                    # Only bare identifiers are handled. Member tags (`<icons.Close>`,
+                    # Only bare identifiers resolve here. Member tags (`<icons.Close>`,
                     # `<props.Comp>`, `<Ctx.Provider>`) are skipped: with a lowercase
                     # receiver the member path falls back to the bare property name and
                     # binds to an unrelated local function. Fragments and namespaced
                     # tags (`<svg:rect>`) have no identifier name either.
                     func_node = node.child_by_field_name("name")
+                    if (func_node is not None
+                            and func_node.type == "member_expression"
+                            and config.ts_module in (
+                                "tree_sitter_javascript", "tree_sitter_typescript",
+                            )):
+                        # `<UI.Button />` is recorded for the import-facts pass
+                        # only (`_js_jsx_member`), which resolves it when UI is a
+                        # namespace import or a default-exported object; extract()
+                        # drops it before any name-based resolver runs.
+                        tag_obj = func_node.child_by_field_name("object")
+                        tag_prop = func_node.child_by_field_name("property")
+                        if (tag_obj is not None and tag_obj.type == "identifier"
+                                and tag_prop is not None):
+                            tag_receiver = _read_text(tag_obj, source)
+                            raw_calls.append({
+                                "caller_nid": caller_nid,
+                                "callee": _read_text(tag_prop, source),
+                                "is_member_call": True,
+                                "source_file": str_path,
+                                "source_location": f"L{node.start_point[0] + 1}",
+                                "receiver": tag_receiver,
+                                "_js_jsx": True,
+                                "_js_jsx_member": True,
+                                "_js_receiver_shadowed": _js_receiver_shadowed(
+                                    node, tag_receiver, source, js_receiver_bindings,
+                                ),
+                            })
                     if (func_node is None
                             or func_node.type != "identifier"
                             or _read_text(func_node, source)[:1].islower()):
@@ -11541,6 +11568,13 @@ def _extract_generic(
                             rc_entry["_js_construct"] = node.type == "new_expression"
                             if ts_constructed_type:
                                 rc_entry["ts_constructed_type"] = ts_constructed_type
+                        elif node.type in _JSX_ELEMENT_TYPES:
+                            # A bare `<Tag />`: the import-facts pass resolves a
+                            # renamed import, unless a local binding shadows it.
+                            rc_entry["_js_jsx"] = True
+                            rc_entry["_js_callee_shadowed"] = _js_receiver_shadowed(
+                                node, callee_name, source, js_receiver_bindings,
+                            )
                         if python_receiver_shadowed is not None and is_member_call:
                             rc_entry["_python_receiver_shadowed"] = python_receiver_shadowed(
                                 node, member_receiver or ""

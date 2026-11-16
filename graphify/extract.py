@@ -11950,6 +11950,15 @@ def extract(
         resolution_context_nodes=resolution_context_nodes,
         raw_calls=all_raw_calls,
     )
+    # Member JSX tags (`<UI.Button />`) resolve only through the import facts
+    # above. Every later resolver would bind them by their last segment alone.
+    if any(rc.get("_js_jsx_member") for rc in all_raw_calls):
+        all_raw_calls[:] = [rc for rc in all_raw_calls if not rc.get("_js_jsx_member")]
+        for result in per_file:
+            if result and result.get("raw_calls"):
+                result["raw_calls"] = [
+                    rc for rc in result["raw_calls"] if not rc.get("_js_jsx_member")
+                ]
 
     # Merge a header-declared class (and its methods) with its sibling-impl
     # definition into ONE node (C/C++/ObjC #1547/#1556). Runs BEFORE the id-remap
