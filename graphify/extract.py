@@ -12680,6 +12680,11 @@ def extract(
         # A C# constructor is named like its type but never called by name.
         if is_csharp_constructor_node(n):
             continue
+        # A JS object-literal member is reached as `obj.key()`, never by a bare
+        # name; indexed, a bare identifier passed as a value (`xs.map(onSuccess)`)
+        # resolved to it as an indirect_call (#2419).
+        if n.get("_js_object_member"):
+            continue
         raw = n.get("label", "")
         normalised = raw.strip("()").lstrip(".")
         if normalised:

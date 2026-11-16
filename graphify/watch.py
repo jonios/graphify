@@ -2759,7 +2759,7 @@ def _rebuild_code(
                         "_ts_public_twin", "_py_property", "_java_ret",
                         "_ts_fields", "_ts_static_fields",
                         "_py_fixture", "_py_return_type", "_go_fields",
-                        "_go_package_path",
+                        "_go_package_path", "_js_object_member",
                     ):
                         if node.get(marker) or (marker.startswith("_cpp_") and isinstance(node.get(marker), (dict, list))):
                             ctx_node[marker] = node[marker]

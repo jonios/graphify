@@ -5066,14 +5066,77 @@ def _scan_python_nested_function_declarations(
 
 
 def _js_topmost_closures(node, out: list) -> None:
-    """Collect the TOPMOST closure nodes (arrow / function expressions) under
-    ``node``, without descending into a found closure — its nested closures
-    belong to it and are reached by the walk_calls closure descend (#1630)."""
+    """Collect the TOPMOST closure nodes (arrow / function expressions, and
+    shorthand methods of an object literal) under ``node``, without descending
+    into a found closure — its nested closures belong to it and are reached by
+    the walk_calls closure descend (#1630)."""
     for c in node.children:
-        if c.type in _JS_FUNCTION_VALUE_TYPES:
+        if c.type in _JS_FUNCTION_VALUE_TYPES or (
+                c.type == "method_definition" and node.type == "object"):
+            # `create({ run() {...} })`: a shorthand method is a closure too (#2419).
             out.append(c)
         else:
             _js_topmost_closures(c, out)
+
+
+def _js_unwrap_parens(node):
+    while node is not None and node.type == "parenthesized_expression":
+        node = next((c for c in node.children if c.is_named), None)
+    return node
+
+
+# A class expression in a config literal keeps its own class handling; its
+# methods are not object-literal members.
+_JS_OBJECT_SCAN_STOP_TYPES = frozenset({"class", "class_declaration", "class_body"})
+
+
+def _js_object_literal_members(value, source: bytes, members: list, keyless: list) -> None:
+    """Split the functions of a module-level object/array literal (#2419).
+
+    ``members`` gets ``(key, function_node)`` for each function-valued
+    property (`k: () => {}`, `k: function () {}`) and shorthand method
+    (`k() {}`) with a plain identifier key, flattened through nested object and
+    array literals (property paths are not modelled, as in #2433). ``keyless``
+    gets every other topmost closure: array elements, computed/string keys, and
+    closures nested in non-literal property values (`k: wrap(() => {})`).
+    Function bodies are never descended into.
+    """
+    if value.type == "object":
+        for child in value.named_children:
+            if child.type == "method_definition":
+                name = child.child_by_field_name("name")
+                if name is not None and name.type == "property_identifier":
+                    members.append((_read_text(name, source), child))
+                else:
+                    keyless.append(child)
+            elif child.type == "pair":
+                key = child.child_by_field_name("key")
+                val = _js_unwrap_parens(child.child_by_field_name("value"))
+                if val is None or val.type in _JS_OBJECT_SCAN_STOP_TYPES:
+                    continue
+                if val.type in _JS_FUNCTION_VALUE_TYPES:
+                    if key is not None and key.type == "property_identifier":
+                        members.append((_read_text(key, source), val))
+                    else:
+                        keyless.append(val)
+                elif val.type in ("object", "array"):
+                    _js_object_literal_members(val, source, members, keyless)
+                else:
+                    _js_topmost_closures(val, keyless)
+            elif child.type == "spread_element":
+                _js_topmost_closures(child, keyless)
+    elif value.type == "array":
+        for element in value.named_children:
+            element = _js_unwrap_parens(element)
+            if element is None or element.type in _JS_OBJECT_SCAN_STOP_TYPES:
+                continue
+            if element.type in ("object", "array"):
+                _js_object_literal_members(element, source, members, keyless)
+            elif element.type in _JS_FUNCTION_VALUE_TYPES:
+                keyless.append(element)
+            else:
+                _js_topmost_closures(element, keyless)
+
 
 def _js_member_assignment_target(left, source: bytes):
     """Classify the symbol an `assignment_expression` LHS defines when its RHS
@@ -5623,6 +5686,54 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
                                     # under const_nid — the union let closure
                                     # A's param suppress a real indirect_call
                                     # to the same name in sibling closure B.
+                                    body = closure.child_by_field_name("body")
+                                    if body:
+                                        if closure_locals_by_body is not None:
+                                            closure_locals_by_body[id(body)] = (
+                                                _js_local_bound_names(closure, source))
+                                        function_bodies.append((const_nid, body))
+                            elif inner is not None and inner.type in ("object", "array"):
+                                # #2419: `const CONFIG = { bulk: { submit: (p) => api(p) } }`
+                                # returns above before the main walk could descend,
+                                # so every function in the literal was dropped. A
+                                # function-valued property / shorthand method becomes
+                                # a `.key()` member owned by the binding (#2433's
+                                # convention); same-named members share one node but
+                                # every body is walked. Keyless closures are walked
+                                # under the binding itself, as for call initializers.
+                                members: list = []
+                                keyless: list = []
+                                _js_object_literal_members(inner, source, members, keyless)
+                                member_nids: set = set()
+                                for key, fn in members:
+                                    if not normalize_id(key):
+                                        keyless.append(fn)
+                                        continue
+                                    member_nid = _make_id(const_nid, key)
+                                    if member_nid not in member_nids:
+                                        member_nids.add(member_nid)
+                                        member_line = fn.start_point[0] + 1
+                                        add_node_fn(member_nid, f".{key}()", member_line)
+                                        # Reached only as `CONFIG.key()`, never by a bare
+                                        # name: kept out of the bare-name maps, or
+                                        # `key: (x) => key(x)` would bind the call to
+                                        # the member itself instead of the import.
+                                        for n in reversed(nodes):
+                                            if n.get("id") == member_nid:
+                                                n["_js_object_member"] = True
+                                                break
+                                        add_edge_fn(const_nid, member_nid, "method", member_line)
+                                        if callable_def_nids is not None:
+                                            callable_def_nids.add(member_nid)
+                                    body = fn.child_by_field_name("body")
+                                    if body:
+                                        # Per-body locals only (#2568): a collapsed
+                                        # member's sibling bodies must not share them.
+                                        if closure_locals_by_body is not None:
+                                            closure_locals_by_body[id(body)] = (
+                                                _js_local_bound_names(fn, source))
+                                        function_bodies.append((member_nid, body))
+                                for closure in keyless:
                                     body = closure.child_by_field_name("body")
                                     if body:
                                         if closure_locals_by_body is not None:
@@ -10129,6 +10240,8 @@ def _extract_generic(
             (n.get("metadata") or {}).get("kind") == "constructor"
         ):
             continue
+        if n.get("_js_object_member"):
+            continue  # object-literal member: `obj.key()` only (#2419)
         raw = n["label"]
         normalised = raw.strip("()").lstrip(".")
         if config.ts_module == "tree_sitter_lua":
