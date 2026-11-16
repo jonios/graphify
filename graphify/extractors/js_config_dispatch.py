@@ -1315,7 +1315,8 @@ def resolve_config_dispatch(paths, nodes, edges, root, raw_calls, resolution_con
                 if (obj is not None and obj.type == "identifier" and prop is not None
                         and _read_text(obj, mod.source) == call["receiver"]
                         and _read_text(prop, mod.source) == call["callee"]
-                        and _inside_function(n)):
+                        and _inside_function(n)
+                        and not _is_import_receiver(res, obj, mod)):
                     sites.append(n)
             if sites:
                 plans.append((call, mod, sites))
@@ -1392,6 +1393,14 @@ def _portable(path, root) -> str:
         return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
     except ValueError:
         return Path(path).as_posix()
+
+
+def _is_import_receiver(res, ident, mod) -> bool:
+    """`snack.error()` on an imported object binding is a member call on an
+    imported object, not dispatch through a selected config: out of this pass's
+    scope (a receiver reached through a local alias or a lookup still resolves)."""
+    binding = res.lookup(ident, mod)
+    return binding is not None and binding[0] == "import"
 
 
 def _inside_function(node) -> bool:

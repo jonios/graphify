@@ -85,14 +85,48 @@ def test_local_alias_and_alias_chain(tmp_path):
     assert _dispatch(r) == [("one", "CONFIG.submit", 0.85), ("two", "CONFIG.submit", 0.85)]
 
 
-def test_imported_config_through_a_barrel(tmp_path):
+def test_imported_lookup_through_a_barrel(tmp_path):
     r = _extract(tmp_path, {
-        "cfg/config.js": "export const CONFIG = { submit: (p) => p };\n",
-        "cfg/index.js": "export { CONFIG } from './config';\n",
-        "app.js": ("import { CONFIG } from './cfg';\n"
-                   "export function save(p) { return CONFIG.submit(p); }\n"),
+        "cfg/config.js": ("export const CONFIG = { submit: (p) => p };\n"
+                          "export const getConfig = () => CONFIG;\n"),
+        "cfg/index.js": "export { getConfig } from './config';\n",
+        "app.js": ("import { getConfig } from './cfg';\n"
+                   "export function save(p) { const c = getConfig(); return c.submit(p); }\n"),
     })
     assert _dispatch(r) == [("save", "CONFIG.submit", 0.85)]
+
+
+def test_direct_imported_object_calls_stay_unresolved(tmp_path):
+    # `snack.error()` on an imported object binding (named, default or through a
+    # barrel) is a member call on an imported object, not config dispatch:
+    # outside this stage, so no edge even though the owner is traceable.
+    r = _extract(tmp_path, {
+        "utils/notify.js": ("export const snack = {\n"
+                            "  error(msg) { this.toast(msg); },\n"
+                            "  toast(msg) { return msg; },\n"
+                            "};\n"
+                            "export default snack;\n"),
+        "utils/index.js": "export { snack } from './notify';\n",
+        "named.js": ("import { snack } from './utils/notify';\n"
+                     "export function a() { snack.error('x'); }\n"),
+        "dflt.js": ("import notify from './utils/notify';\n"
+                    "export function b() { notify.error('x'); }\n"),
+        "barrel.js": ("import { snack } from './utils';\n"
+                      "export function c() { snack.error('x'); }\n"),
+    })
+    assert _dispatch(r) == []
+
+
+def test_local_alias_of_an_imported_config_still_resolves(tmp_path):
+    # The exclusion is the direct import receiver only; a local alias is the
+    # approved alias pattern and is traced like any other.
+    r = _extract(tmp_path, {
+        "cfg.js": "export const CONFIG = { submit: (p) => p };\n",
+        "app.js": ("import { CONFIG } from './cfg';\n"
+                   "export function direct(p) { return CONFIG.submit(p); }\n"
+                   "export function aliased(p) { const c = CONFIG; return c.submit(p); }\n"),
+    })
+    assert _dispatch(r) == [("aliased", "CONFIG.submit", 0.85)]
 
 
 def test_lookup_with_one_return(tmp_path):
